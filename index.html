@@ -790,12 +790,12 @@ body {
       <div class="form-group">
         <label class="form-label">AI Model</label>
         <select class="form-select" id="s-model">
-          <option value="gemini-2.5-flash-lite">⚡ Gemini 2.5 Flash-Lite — Best free quota (1000/day) ✓ Recommended</option>
-          <option value="gemini-2.5-flash">🔥 Gemini 2.5 Flash — Better quality (250/day)</option>
-          <option value="gemini-2.0-flash">🌀 Gemini 2.0 Flash — Previous gen (stable)</option>
-          <option value="gemini-1.5-flash">📦 Gemini 1.5 Flash — Legacy fallback</option>
+          <option value="gemini-3.1-flash-lite">⚡ Gemini 3.1 Flash-Lite — Best free quota ✓ Recommended</option>
+          <option value="gemini-3.5-flash">🔥 Gemini 3.5 Flash — Better quality</option>
+          <option value="gemini-2.5-flash">🌀 Gemini 2.5 Flash — Previous gen</option>
+          <option value="gemini-2.5-flash-lite">📦 Gemini 2.5 Flash-Lite — Legacy fallback</option>
         </select>
-        <div class="form-hint">Flash-Lite has the highest free quota and works great for English coaching</div>
+        <div class="form-hint">If a model stops responding (Google retires model IDs often), the app will auto-fallback to the next one in the list.</div>
       </div>
       <div class="form-group">
         <label class="form-label">Primary Goal</label>
@@ -1058,10 +1058,15 @@ body {
 'use strict';
 
 /* ── State ─────────────────────────────────────────────── */
+// Google retires Gemini model IDs faster than their published shutdown dates.
+// Keep this list in priority order; sendToGemini() will step through it
+// automatically if the active model starts 404-ing as "no longer available".
+const MODEL_FALLBACKS = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+
 let config = {
   apiKey: '', name: 'Learner',
   level: 'intermediate', goal: 'general',
-  model: 'gemini-2.5-flash-lite',
+  model: 'gemini-3.1-flash-lite',
   tts: false, feedback: true, memory: true,
   streak: 0, xp: 0, lastDate: null
 };
@@ -1180,7 +1185,7 @@ function openSettings() {
   document.getElementById('s-name').value   = config.name;
   document.getElementById('s-level').value  = config.level;
   document.getElementById('s-goal').value   = config.goal;
-  document.getElementById('s-model').value  = config.model || 'gemini-2.5-flash-lite';
+  document.getElementById('s-model').value  = config.model || 'gemini-3.1-flash-lite';
   refreshToggleUI();
   document.getElementById('settingsOverlay').classList.remove('hidden');
 }
@@ -1452,10 +1457,12 @@ function updateLevelUI() {
 }
 
 /* ── Gemini API ───────────────────────────────────────── */
-async function sendToGemini(text, retryCount = 0) {
+async function sendToGemini(text, retryCount = 0, modelOverride = null) {
   if (!config.apiKey) { toast('⚠️ No API key — Open Settings', 'warn'); return; }
   if (isBusy) return;
   isBusy = true;
+
+  const modelToUse = modelOverride || config.model || MODEL_FALLBACKS[0];
 
   setStatus('busy', 'Mentor is thinking…');
   showTyping();
@@ -1476,7 +1483,7 @@ async function sendToGemini(text, retryCount = 0) {
 
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${config.model || 'gemini-2.5-flash-lite'}:generateContent?key=${config.apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelToUse}:generateContent?key=${config.apiKey}`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
     );
     const data = await res.json();
@@ -1521,13 +1528,34 @@ async function sendToGemini(text, retryCount = 0) {
   } catch(err) {
     removeTyping();
     chatHistory.pop(); // remove failed user message
+
+    // Google retires Gemini model IDs ahead of their published shutdown dates.
+    // If the current model 404s as retired, step to the next one in MODEL_FALLBACKS
+    // and silently retry the same message instead of surfacing an error.
+    const modelRetired = /no longer available|NOT_FOUND/i.test(err.message);
+    if (modelRetired) {
+      const idx = MODEL_FALLBACKS.indexOf(modelToUse);
+      const nextModel = MODEL_FALLBACKS[idx + 1]; // undefined if not found (-1+1=0) is handled below
+      const fallback = idx === -1 ? MODEL_FALLBACKS[0] : nextModel;
+      if (fallback && fallback !== modelToUse) {
+        toast(`⚠️ "${modelToUse}" was retired — switching to "${fallback}"`, 'warn');
+        config.model = fallback;
+        saveConfig();
+        const sel = document.getElementById('s-model');
+        if (sel) sel.value = fallback;
+        isBusy = false;
+        sendToGemini(text, retryCount, fallback);
+        return;
+      }
+    }
+
     if (retryCount < 2 && err.message.includes('503')) {
       toast('⏳ Retrying…');
       setTimeout(() => { isBusy = false; sendToGemini(text, retryCount + 1); }, 2000);
       return;
     }
     setStatus('ok', 'Error — try again');
-    renderMentorMsg(`Sorry, I couldn't connect. ${err.message.includes('API_KEY') ? 'Please check your API key in Settings.' : 'Please try again in a moment.'}`, null);
+    renderMentorMsg(`Sorry, I couldn't connect. ${err.message.includes('API_KEY') ? 'Please check your API key in Settings.' : modelRetired ? 'All fallback models are unavailable — please check your API key or model list.' : 'Please try again in a moment.'}`, null);
     toast('❌ Error: ' + err.message.slice(0, 60), 'error');
   } finally {
     isBusy = false;
